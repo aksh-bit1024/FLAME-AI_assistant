@@ -1,4 +1,5 @@
 import sys
+import json
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -8,6 +9,7 @@ from rich.prompt import Prompt
 from core.llm_client import LLMClient
 from core.router import ModelRouter
 from core.memory import MemoryManager
+from tools.dispatcher import ToolDispatcher
 
 # Initialize Rich console
 console = Console()
@@ -15,7 +17,7 @@ console = Console()
 def display_header(user_name: str):
     """Renders a styled header panel on startup or screen clear."""
     title = Text("🔥  FLAME  AI  ASSISTANT", style="bold bright_white")
-    subtitle = Text("Memory  •  Model Router  •  Ready", style="italic bright_black")
+    subtitle = Text("Memory  •  Model Router  •  Tools Active", style="italic bright_black")
     user_info = Text.assemble(
         Text("\nWelcome, ", style="bright_black"),
         Text(user_name, style="bold yellow"),
@@ -47,6 +49,7 @@ def main():
     llm = LLMClient()
     router = ModelRouter(llm)
     memory = MemoryManager(db_path="data/memory.sqlite")
+    dispatcher = ToolDispatcher()
 
     user_name = memory.get_preference("user_name", "User")
     display_header(user_name)
@@ -54,7 +57,7 @@ def main():
     chat_history = [
         {
             "role": "system",
-            "content": f"You are Flame, a helpful local terminal assistant for {user_name}. Keep explanations concise, clear, and easy to read in a CLI terminal."
+            "content": f"You are Flame, a helpful local terminal assistant for {user_name}. Keep explanations concise, clear, and easy to read in a CLI terminal. You have tools available for file operations and system execution."
         }
     ]
 
@@ -120,25 +123,83 @@ def main():
             )
 
             chat_history.append({"role": "user", "content": user_input})
-            active_history = memory.trim_history(chat_history, max_messages=10)
 
-            # Render live spinner while query is running
-            with console.status("[bold orange1]🔥 Flame is thinking...[/bold orange1]", spinner="simpleDots"):
-                response_text = llm.chat(active_history, model=chosen_model)
-            
-            # Pretty render Flame response with Markdown support inside a Panel
-            console.print(
-                Panel(
-                    Markdown(response_text),
-                    title="[bold orange1]🔥 Flame[/bold orange1]",
-                    title_align="left",
-                    border_style="orange1",
-                    padding=(1, 2)
-                )
-            )
-            console.print("")
-            
-            chat_history.append({"role": "assistant", "content": response_text})
+            # --- Tool Execution Sub-loop ---
+            while True:
+                active_history = memory.trim_history(chat_history, max_messages=12)
+
+                with console.status("[bold orange1]🔥 Flame is thinking...[/bold orange1]", spinner="simpleDots"):
+                    # Call LLM passing tool schemas
+                    response = llm.client.chat.completions.create(
+                        model=chosen_model,
+                        messages=active_history,
+                        tools=dispatcher.get_schemas(),
+                        tool_choice="auto"
+                    )
+
+                response_message = response.choices[0].message
+                
+                # Check if model triggered a tool call
+                if response_message.tool_calls:
+                    # Append assistant tool call request to chat history
+                    chat_history.append(response_message)
+
+                    for tool_call in response_message.tool_calls:
+                        function_name = tool_call.function.name
+                        arguments = json.loads(tool_call.function.arguments or "{}")
+
+                        # Display Tool Execution Callout Box
+                        console.print(
+                            Panel(
+                                f"[bold white]Tool:[/bold white] {function_name}\n[bold white]Args:[/bold white] {json.dumps(arguments)}",
+                                title="[bold yellow]⚙️ Tool Execution Requested[/bold yellow]",
+                                border_style="yellow",
+                                padding=(0, 1)
+                            )
+                        )
+
+                        try:
+                            # Run tool via dispatcher
+                            result = dispatcher.execute(function_name, arguments)
+                        except Exception as e:
+                            result = {"status": "error", "error": str(e)}
+
+                        # Display Tool Result
+                        console.print(
+                            Panel(
+                                f"[dim]{json.dumps(result, indent=2)}[/dim]",
+                                title="[dim green]✅ Tool Output[/dim green]",
+                                border_style="dim green",
+                                padding=(0, 1)
+                            )
+                        )
+
+                        # Feedback result to LLM context
+                        chat_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(result)
+                        })
+
+                    # Continue sub-loop to give LLM a turn to inspect tool output
+                    continue
+
+                # Final text output from Assistant
+                if response_message.content:
+                    response_text = response_message.content
+                    console.print(
+                        Panel(
+                            Markdown(response_text),
+                            title="[bold orange1]🔥 Flame[/bold orange1]",
+                            title_align="left",
+                            border_style="orange1",
+                            padding=(1, 2)
+                        )
+                    )
+                    console.print("")
+                    chat_history.append({"role": "assistant", "content": response_text})
+
+                break
 
         except KeyboardInterrupt:
             console.print("\n[bold red]🔥 Flame shutting down... Goodbye![/bold red]")
