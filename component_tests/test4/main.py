@@ -1,36 +1,117 @@
 import sys
+import json
+import time
 from pathlib import Path
 
-# Force current folder into sys.path
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR)) 
-    
-import json
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich.markdown import Markdown
-from rich.prompt import Prompt
 
-from core.llm_client import LLMClient
-from core.router import ModelRouter
+# Path resolution
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from core.llm_client import LLMClient, STRICT_SYSTEM_PROMPT
+from core.router import LLMRouter
 from core.memory import MemoryManager
 from tools.dispatcher import ToolDispatcher
 
-# Initialize Rich console
 console = Console()
 
-def display_header(user_name: str):
-    """Renders a styled header panel on startup or screen clear."""
-    title = Text("🔥  FLAME  AI  ASSISTANT", style="bold bright_white")
-    subtitle = Text("Memory  •  Model Router  •  Tools Active", style="italic bright_black")
-    user_info = Text.assemble(
-        Text("\nWelcome, ", style="bright_black"),
-        Text(user_name, style="bold yellow"),
-    )
+SYSTEM_PROMPT = f"""{STRICT_SYSTEM_PROMPT}
 
-    header_text = Text.assemble(title, "\n", subtitle, user_info, justify="center")
+You are Flame, an autonomous CLI assistant.
+
+ACTIVE MEMORY PROTOCOL:
+- When the user mentions personal details, preferences, workflow habits, or project rules, call `save_memory(key, value)` immediately to persist them.
+
+AUTONOMOUS ERROR DIAGNOSTICS:
+- If a tool call fails (e.g., returns error output, missing file, or non-zero exit code):
+  1. Inspect the error output and stderr details carefully.
+  2. Reformulate your plan (e.g., correct paths, adjust command flags, check list_directory).
+  3. Automatically issue a new, corrected tool call without quitting or asking the user prematurely.
+"""
+
+MODEL_TARGETS = {
+    "heavy": "heavy_general",
+    "14b": "heavy_general",
+    "qwen": "heavy_general",
+    "heavy_general": "heavy_general",
+    "coder": "coder",
+    "code": "coder",
+    "py": "coder",
+    "reasoning": "reasoning",
+    "r1": "reasoning",
+    "think": "reasoning",
+    "fast": "general_default",
+    "general": "general_default",
+    "gemma": "general_default",
+    "general_default": "general_default",
+}
+INLINE_MODEL_ALIASES = {
+    "/heavy": "heavy_general",
+    "/14b": "heavy_general",
+    "/qwen": "heavy_general",
+    "/coder": "coder",
+    "/code": "coder",
+    "/py": "coder",
+    "/reasoning": "reasoning",
+    "/r1": "reasoning",
+    "/think": "reasoning",
+    "/fast": "general_default",
+    "/general": "general_default",
+    "/gemma": "general_default",
+}
+VALID_MODEL_ALIASES = "/heavy, /coder, /reasoning, /fast, /auto"
+
+
+def resolve_model_target(target: str):
+    return MODEL_TARGETS.get(target.strip().lower())
+
+
+def parse_model_command(user_input: str):
+    """Return (action, prompt, target) for model-related slash commands."""
+    command, separator, remainder = user_input.partition(" ")
+    command = command.lower()
+
+    if command in INLINE_MODEL_ALIASES:
+        if not separator or not remainder.strip():
+            return "invalid", "", None
+        return "prompt", remainder.strip(), INLINE_MODEL_ALIASES[command]
+
+    if command in ("/model", "/use"):
+        target_name = remainder.strip().lower() if separator else ""
+        if target_name == "auto":
+            return "unlock", "", None
+        target = resolve_model_target(target_name) if target_name else None
+        if target is None:
+            return "invalid", "", None
+        return "lock", "", target
+
+    if command == "/auto":
+        if remainder.strip():
+            return "invalid", "", None
+        return "unlock", "", None
+
+    if command == "/lock":
+        if remainder.strip():
+            return "invalid", "", None
+        return "lock_current", "", None
+
+    if command == "/unlock":
+        if remainder.strip():
+            return "invalid", "", None
+        return "unlock", "", None
+
+    return "unrecognized", "", None
+
+def display_banner():
+    header_text = Text()
+    header_text.append("FLAME CLI SYSTEM\n", style="bold orange1")
+    header_text.append("Autonomous Diagnostic & Semantic Router Shell", style="dim orange1")
+    header_text.append("\n\nCommands: /memory  |  /clear  |  exit", style="dark_orange")
 
     console.print(
         Panel(
@@ -42,175 +123,184 @@ def display_header(user_name: str):
             expand=False,
         )
     )
-    console.print(
-        "[bright_black]╭─[/bright_black] [bold cyan]/clear[/bold cyan] [dim]screen[/dim]  "
-        "[bright_black]│[/bright_black] [bold cyan]/memory[/bold cyan] [dim]memory[/dim]  "
-        "[bright_black]│[/bright_black] [bold cyan]/help[/bold cyan] [dim]commands[/dim]  "
-        "[bright_black]│[/bright_black] [bold red]exit[/bold red] [dim]quit[/dim] [bright_black]─╮[/bright_black]\n"
-    )
+
+def run_with_thinking(operation):
+    status = console.status("[dim]thinking...[/dim]", spinner="dots")
+    status.start()
+    try:
+        return operation()
+    finally:
+        status.stop()
 
 def main():
-    console.clear()
-    
-    # Initialize core modules
+    memory_mgr = MemoryManager()
+    dispatcher = ToolDispatcher(memory_manager=memory_mgr)
     llm = LLMClient()
-    router = ModelRouter(llm)
-    memory = MemoryManager(db_path="data/memory.sqlite")
-    dispatcher = ToolDispatcher()
+    router = LLMRouter(llm_client=llm)
 
-    user_name = memory.get_preference("user_name", "User")
-    display_header(user_name)
+    chat_history = []
+    current_session_model = None
+    active_model = None
 
-    chat_history = [
-        {
-            "role": "system",
-            "content": f"You are Flame, a helpful local terminal assistant for {user_name}. Keep explanations concise, clear, and easy to read in a CLI terminal. You have tools available for file operations and system execution."
-        }
-    ]
+    display_banner()
 
     while True:
         try:
-            # Custom styled input prompt
-            user_input = Prompt.ask("[bold cyan]You[/bold cyan]").strip()
-            
-            if not user_input:
+            user_input = console.input("\n[bold orange1]USER>[/bold orange1] ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim orange1][SYS] Terminating process.[/dim orange1]")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ["exit", "quit"]:
+            console.print("[dim orange1][SYS] Goodbye.[/dim orange1]")
+            break
+
+        # Command Handlers
+        if user_input == "/memory":
+            memories = memory_mgr.get_all_preferences()
+            console.print("\n[bold orange1][MEM] Stored preferences:[/bold orange1]")
+            console.print(json.dumps(memories, indent=2) if memories else "  (none)")
+            continue
+
+        if user_input == "/clear":
+            chat_history = []
+            console.print("[dim orange1][SYS] Session context purged.[/dim orange1]")
+            continue
+
+        prompt_for_model = user_input
+        one_turn_model = None
+        if user_input.startswith("/"):
+            action, prompt_for_model, one_turn_model = parse_model_command(user_input)
+            if action == "lock":
+                current_session_model = one_turn_model
+                active_model = one_turn_model
+                console.print(f"[dim]Session locked to: {current_session_model}[/dim]")
+                continue
+            if action == "lock_current":
+                if active_model is None:
+                    console.print("[dim]No active model to lock[/dim]")
+                else:
+                    current_session_model = active_model
+                    console.print(f"[dim]Session locked to: {current_session_model}[/dim]")
+                continue
+            if action == "unlock":
+                current_session_model = None
+                console.print("[dim]Session model lock released; routing is automatic[/dim]")
+                continue
+            if action == "prompt":
+                pass
+            elif action in ("invalid", "unrecognized"):
+                console.print(
+                    f"[dim]Valid model aliases: {VALID_MODEL_ALIASES}[/dim]"
+                )
                 continue
 
-            # Handle application exit
-            if user_input.lower() in ["exit", "quit"]:
-                console.print("\n[bold red]🔥 Flame shutting down... Goodbye![/bold red]")
-                break
+        # 1. Route Intent & Log Classification Latency (in ms)
+        if one_turn_model is not None:
+            chosen_model = one_turn_model
+            route_ms = 0.0
+            route_notice = " (Bypassed via /command)"
+        elif current_session_model is not None:
+            chosen_model = current_session_model
+            route_ms = 0.0
+            route_notice = " (Session Locked)"
+        else:
+            chosen_model, route_ms = run_with_thinking(
+                lambda: router.route_with_timing(prompt_for_model)
+            )
+            route_notice = ""
+            current_session_model = chosen_model
+        active_model = chosen_model
+        lock_indicator = " [LOCKED]" if current_session_model else " [AUTO]"
+        console.print(
+            f"[dim orange1][ROUTER][/dim orange1] Model: [bold orange1]{chosen_model}{lock_indicator}[/bold orange1] "
+            f"([cyan]{route_ms:.1f} ms{route_notice}[/cyan])"
+        )
 
-            # Handle slash commands
-            if user_input.startswith("/"):
-                cmd = user_input.lower()
-                if cmd == "/clear":
-                    console.clear()
-                    display_header(user_name)
-                    continue
-                elif cmd == "/memory":
-                    pref_name = memory.get_preference("user_name", "Not Set")
-                    console.print(
-                        Panel(
-                            f"[bold yellow]Current user_name preference:[/bold yellow] {pref_name}",
-                            title="[bold blue]🧠 Memory State[/bold blue]",
-                            border_style="blue"
-                        )
-                    )
-                    continue
-                elif cmd == "/help":
-                    console.print("[yellow]Commands:[/yellow] /clear - Clear screen | /memory - Show stored key-values | exit - Quit\n")
-                    continue
+        # 2. Prepare Context Injection
+        current_memories = memory_mgr.get_all_preferences()
+        dynamic_system_prompt = (
+            f"{SYSTEM_PROMPT}\n\nCURRENT STORED MEMORIES:\n"
+            f"{json.dumps(current_memories, indent=2)}"
+        )
 
-            # Check and store name changes in SQLite memory
-            if "my name is" in user_input.lower():
-                parts = user_input.lower().split("my name is")
-                if len(parts) > 1:
-                    extracted_name = parts[1].strip().split()[0].capitalize()
-                    memory.set_preference("user_name", extracted_name)
-                    user_name = extracted_name
-                    console.print(
-                        Panel(
-                            f"Saved new user_name preference: [bold green]{extracted_name}[/bold green]",
-                            title="[bold blue]🧠 Memory Updated[/bold blue]",
-                            border_style="blue",
-                            padding=(0, 2)
-                        )
-                    )
+        if chat_history and chat_history[0].get("role") == "system":
+            chat_history[0]["content"] = dynamic_system_prompt
+        else:
+            chat_history.insert(0, {"role": "system", "content": dynamic_system_prompt})
 
-            # Route intent and display routing badge
-            intent, chosen_model = router.route(user_input)
-            console.print(
-                Panel(
-                    f"[dim]Intent:[/dim] [bold white]{intent}[/bold white]  │  [dim]Model:[/dim] [bold green]{chosen_model}[/bold green]",
-                    title="[dim green]⚙️ Model Router[/dim green]",
-                    border_style="dim green",
-                    padding=(0, 1)
+        chat_history.append({"role": "user", "content": prompt_for_model})
+
+        # 3. Start Main Response Timer
+        start_response_time = time.perf_counter()
+
+        max_diagnostic_turns = 5
+        turn_count = 0
+
+        # Multi-Turn Diagnostic Loop
+        while turn_count < max_diagnostic_turns:
+            turn_count += 1
+            trimmed_messages = memory_mgr.trim_history(chat_history, max_messages=10)
+
+            response = run_with_thinking(
+                lambda: llm.chat(
+                    model=chosen_model,
+                    messages=trimmed_messages,
+                    tools=dispatcher.get_schemas()
                 )
             )
 
-            chat_history.append({"role": "user", "content": user_input})
+            response_message = response.choices[0].message
 
-            # --- Tool Execution Sub-loop ---
-            while True:
-                active_history = memory.trim_history(chat_history, max_messages=12)
+            if response_message.tool_calls:
+                chat_history.append(response_message)
 
-                with console.status("[bold orange1]🔥 Flame is thinking...[/bold orange1]", spinner="simpleDots"):
-                    # Call LLM passing tool schemas
-                    response = llm.client.chat.completions.create(
-                        model=chosen_model,
-                        messages=active_history,
-                        tools=dispatcher.get_schemas(),
-                        tool_choice="auto"
-                    )
-
-                response_message = response.choices[0].message
-                
-                # Check if model triggered a tool call
-                if response_message.tool_calls:
-                    # Append assistant tool call request to chat history
-                    chat_history.append(response_message)
-
-                    for tool_call in response_message.tool_calls:
-                        function_name = tool_call.function.name
-                        arguments = json.loads(tool_call.function.arguments or "{}")
-
-                        # Display Tool Execution Callout Box
-                        console.print(
-                            Panel(
-                                f"[bold white]Tool:[/bold white] {function_name}\n[bold white]Args:[/bold white] {json.dumps(arguments)}",
-                                title="[bold yellow]⚙️ Tool Execution Requested[/bold yellow]",
-                                border_style="yellow",
-                                padding=(0, 1)
-                            )
-                        )
-
+                for tool_call in response_message.tool_calls:
+                    func_name = tool_call.function.name
+                    try:
+                        args = json.loads(tool_call.function.arguments or "{}")
+                        if not isinstance(args, dict):
+                            raise ValueError("Tool arguments must be a JSON object.")
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        args = {}
+                        result = {"status": "error", "error": f"Invalid tool arguments: {exc}"}
+                    else:
                         try:
-                            # Run tool via dispatcher
-                            result = dispatcher.execute(function_name, arguments)
-                        except Exception as e:
-                            result = {"status": "error", "error": str(e)}
+                            result = dispatcher.execute(func_name, args)
+                        except Exception as exc:
+                            result = {"status": "error", "error": str(exc)}
 
-                        # Display Tool Result
-                        console.print(
-                            Panel(
-                                f"[dim]{json.dumps(result, indent=2)}[/dim]",
-                                title="[dim green]✅ Tool Output[/dim green]",
-                                border_style="dim green",
-                                padding=(0, 1)
-                            )
-                        )
-
-                        # Feedback result to LLM context
-                        chat_history.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": json.dumps(result)
-                        })
-
-                    # Continue sub-loop to give LLM a turn to inspect tool output
-                    continue
-
-                # Final text output from Assistant
-                if response_message.content:
-                    response_text = response_message.content
                     console.print(
-                        Panel(
-                            Markdown(response_text),
-                            title="[bold orange1]🔥 Flame[/bold orange1]",
-                            title_align="left",
-                            border_style="orange1",
-                            padding=(1, 2)
-                        )
+                        f"[dim orange1][EXEC][/dim orange1] "
+                        f"[bold dark_orange]{func_name}[/bold dark_orange]({args})"
                     )
-                    console.print("")
-                    chat_history.append({"role": "assistant", "content": response_text})
+                    chat_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(result)
+                    })
 
+                continue
+
+            if response_message.content:
+                # Stop response timer and convert duration to minutes
+                elapsed_min = (time.perf_counter() - start_response_time) / 60
+
+                console.print("\n[bold orange1]FLAME>[/bold orange1]")
+                console.print(Markdown(response_message.content))
+                
+                console.print(
+                    f"\n[dim orange1][PERF][/dim orange1] Generation complete in "
+                    f"[bold dark_orange]{elapsed_min:.3f} min[/bold dark_orange]\n"
+                )
+                
+                chat_history.append({"role": "assistant", "content": response_message.content})
                 break
-
-        except KeyboardInterrupt:
-            console.print("\n[bold red]🔥 Flame shutting down... Goodbye![/bold red]")
-            break
+        else:
+            console.print("\n[bold red][ERROR] Maximum diagnostic retry limit reached.[/bold red]")
 
 if __name__ == "__main__":
     main()

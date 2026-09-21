@@ -1,28 +1,70 @@
-from openai import OpenAI
+import re
+from importlib import import_module
+
+STRICT_SYSTEM_PROMPT = (
+    "You are an expert technical assistant. Answer the user's prompt directly, thoroughly, "
+    "and completely according to all structural requirements. Do not provide study guides, "
+    "meta-commentary, or instructions on how to read the prompt."
+)
 
 class LLMClient:
-    # We set the URL to Port 13305 and pick one of your specific Lemonade models
-    def __init__(self, base_url="http://localhost:13305/v1", api_key="lemonade-key", default_model="gemma4-it-e4b-FLM"):
-        """
-        Initializes the connection to the Lemonade inference server.
-        """
-        # The OpenAI client lets us talk to Lemonade just like we would talk to a cloud AI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
-        self.default_model = default_model
+    def __init__(self, base_url: str = "http://localhost:8000/v1", api_key: str = "local"):
+        openai = import_module("openai")
+        self.client = openai.OpenAI(base_url=base_url, api_key=api_key)
 
-    def chat(self, messages, model=None, temperature=0.7):
-        """Sends a list of chat messages to the local AI model."""
-        # If we don't ask for a specific model, use the default (Gemma 4)
-        target_model = model or self.default_model
-        
-        try:
-            # Send the request to Lemonade and wait for the response
-            response = self.client.chat.completions.create(
-                model=target_model,
-                messages=messages,
-                temperature=temperature
+    def chat(
+        self,
+        model: str,
+        messages: list,
+        tools: list = None,
+        temperature: float = None,
+        max_tokens: int = None,
+        stop: list[str] = None,
+    ):
+        """
+        Executes chat completion with dynamic model selection and 
+        DeepSeek reasoning tag sanitization.
+        """
+        prepared_messages = list(messages)
+        if not (
+            prepared_messages
+            and prepared_messages[0].get("role") == "system"
+            and prepared_messages[0].get("content") == STRICT_SYSTEM_PROMPT
+        ):
+            prepared_messages.insert(
+                0,
+                {"role": "system", "content": STRICT_SYSTEM_PROMPT},
             )
-            # Return just the text of the AI's answer
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"[Connection Error]: Could not reach Lemonade. Details: {e}"
+
+        kwargs = {
+            "model": model,
+            "messages": prepared_messages,
+        }
+
+        # Keep standard OpenAI message objects and stop Qwen models at ChatML boundaries.
+        if "qwen" in model.lower():
+            kwargs.update(
+                temperature=0.7 if temperature is None else temperature,
+                max_tokens=1500 if max_tokens is None else max_tokens,
+                stop=stop or ["<|im_end|>", "<|endoftext|>", "<|im_start|>"],
+            )
+        else:
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            if stop is not None:
+                kwargs["stop"] = stop
+        
+        # Only pass tools schema if provided
+        if tools:
+            kwargs["tools"] = tools
+
+        response = self.client.chat.completions.create(**kwargs)
+        
+        # Sanitize <think> tags from DeepSeek R1 outputs
+        msg = response.choices[0].message
+        if msg.content and "<think>" in msg.content:
+            msg.content = re.sub(r"<think>.*?(?:</think>|$)", "", msg.content, flags=re.DOTALL).strip()
+
+        return response

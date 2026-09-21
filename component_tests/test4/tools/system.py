@@ -30,7 +30,14 @@ def run_command(command: str, timeout: int = 30, cwd: Optional[str] = None) -> D
             }
 
     # --- Strategy 2 Guard: Path Sandboxing ---
-    target_dir = Path(cwd).resolve() if cwd else PROJECT_ROOT
+    if not isinstance(command, str) or not command.strip():
+        return {"status": "error", "exit_code": -1, "stdout": "", "stderr": "Command must be a non-empty string."}
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
+        return {"status": "error", "exit_code": -1, "stdout": "", "stderr": "Timeout must be an integer from 1 to 300 seconds."}
+    if cwd is not None and not isinstance(cwd, (str, os.PathLike)):
+        return {"status": "error", "exit_code": -1, "stdout": "", "stderr": "Working directory must be a path string."}
+
+    target_dir = (PROJECT_ROOT / cwd).resolve() if cwd else PROJECT_ROOT
     try:
         # Verify target_dir is at or inside PROJECT_ROOT
         target_dir.relative_to(PROJECT_ROOT)
