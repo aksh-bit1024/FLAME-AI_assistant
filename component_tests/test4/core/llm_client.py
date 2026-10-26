@@ -11,6 +11,62 @@ class LLMClient:
     def __init__(self, base_url: str = "http://localhost:8000/v1", api_key: str = "local"):
         openai = import_module("openai")
         self.client = openai.OpenAI(base_url=base_url, api_key=api_key)
+        self.available_models = self._discover_models()
+
+    def _discover_models(self) -> list[str]:
+        try:
+            response = self.client.models.list()
+            models = getattr(response, "data", response)
+            available = []
+            for model in models or []:
+                model_id = model.get("id") if isinstance(model, dict) else getattr(model, "id", None)
+                if model_id:
+                    available.append(str(model_id))
+            return available
+        except Exception as exc:
+            print(f"[WARNING] Unable to discover Lemonade models: {exc}")
+            return []
+
+    def resolve_model_name(self, target_alias: str) -> str:
+        """Resolve an internal target or model hint to an available backend ID."""
+        available_models = getattr(self, "available_models", [])
+        if not available_models:
+            return target_alias
+
+        target = str(target_alias)
+        exact_match = next(
+            (model for model in available_models if model == target), None
+        )
+        if exact_match:
+            return exact_match
+
+        aliases = {
+            "heavy_general": "qwen2.5-14b",
+            "coder": "qwen2.5-coder-7b",
+            "reasoning": "deepseek-r1-distill-qwen-1.5b",
+            "general_default": "gemma4-it-e4b",
+            "fast_tool": "gemma4-it-e2b",
+        }
+        target_lower = target.lower()
+        search_terms = [target_lower, aliases.get(target_lower, "")]
+        search_terms.extend(
+            hint for hint in set(aliases.values()) if hint in target_lower
+        )
+        for term in search_terms:
+            if not term:
+                continue
+            match = next(
+                (model for model in available_models if term in model.lower()), None
+            )
+            if match:
+                return match
+
+        fallback_model = available_models[0]
+        print(
+            f"[WARNING] Model alias '{target_alias}' not found. "
+            f"Falling back to '{fallback_model}'"
+        )
+        return fallback_model
 
     def chat(
         self,
@@ -25,6 +81,7 @@ class LLMClient:
         Executes chat completion with dynamic model selection and 
         DeepSeek reasoning tag sanitization.
         """
+        model = self.resolve_model_name(model)
         prepared_messages = list(messages)
         if not (
             prepared_messages

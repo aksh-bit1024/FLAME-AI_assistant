@@ -64,17 +64,29 @@ INLINE_MODEL_ALIASES = {
     "/general": "general_default",
     "/gemma": "general_default",
 }
-VALID_MODEL_ALIASES = "/heavy, /coder, /reasoning, /fast, /auto"
+VALID_MODEL_ALIASES = "/heavy, /coder, /reasoning, /fast, /auto, /consensus"
 
 
 def resolve_model_target(target: str):
     return MODEL_TARGETS.get(target.strip().lower())
 
 
+def resolve_backend_model(router, model_target: str):
+    """Convert an internal target key to the registered backend model ID."""
+    return router.models.get(model_target, model_target)
+
+
+def resolve_available_model(llm, router, model_target: str):
+    return llm.resolve_model_name(resolve_backend_model(router, model_target))
+
+
 def parse_model_command(user_input: str):
     """Return (action, prompt, target) for model-related slash commands."""
     command, separator, remainder = user_input.partition(" ")
     command = command.lower()
+
+    if command == "/consensus":
+        return "consensus", remainder.strip() if separator else "", None
 
     if command in INLINE_MODEL_ALIASES:
         if not separator or not remainder.strip():
@@ -132,6 +144,49 @@ def run_with_thinking(operation):
     finally:
         status.stop()
 
+
+
+def run_consensus_query(client, prompt: str) -> str:
+    """
+    Multi-model consensus mode:
+    Step 1: Generate a draft using Qwen2.5-7B-Instruct-NPU.
+    Step 2: Polish and output the final verified response using DeepSeek-R1.
+    """
+    print("\n[CONSENSUS] Step 1: Generating initial draft with Qwen2.5-7B-NPU...")
+    
+    # Step 1: Draft generation
+    draft_response = client.chat.completions.create(
+        model="Qwen2.5-7B-Instruct-NPU",
+        messages=[
+            {"role": "system", "content": "You are a precise technical expert. Provide a detailed, accurate response."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    draft_text = draft_response.choices[0].message.content
+
+    print("[CONSENSUS] Step 2: Refining and verifying with DeepSeek-R1...")
+    
+    # Step 2: Produce the final response directly.
+    verify_response = client.chat.completions.create(
+        model="DeepSeek-R1-Distill-Qwen-1.5B-NPU",
+        messages=[
+            {
+                "role": "system", 
+                "content": (
+                    "You are an expert editor and domain specialist. Below is a draft answering a user prompt, "
+                    "along with the original prompt. Your task is to output the final, polished, and fully corrected "
+                    "response that directly answers the user's prompt. Do NOT write meta-commentary or talk about the draft; "
+                    "instead, output the completed, high-quality final answer directly."
+                )
+            },
+            {"role": "user", "content": f"Original Prompt: {prompt}\n\nDraft Response to Polish:\n{draft_text}"}
+        ],
+        temperature=0.1
+    )
+    
+    return verify_response.choices[0].message.content
+
 def main():
     memory_mgr = MemoryManager()
     dispatcher = ToolDispatcher(memory_manager=memory_mgr)
@@ -173,10 +228,11 @@ def main():
         prompt_for_model = user_input
         one_turn_model = None
         if user_input.startswith("/"):
+
             action, prompt_for_model, one_turn_model = parse_model_command(user_input)
             if action == "lock":
-                current_session_model = one_turn_model
-                active_model = one_turn_model
+                current_session_model = resolve_available_model(llm, router, one_turn_model)
+                active_model = current_session_model
                 console.print(f"[dim]Session locked to: {current_session_model}[/dim]")
                 continue
             if action == "lock_current":
@@ -190,6 +246,16 @@ def main():
                 current_session_model = None
                 console.print("[dim]Session model lock released; routing is automatic[/dim]")
                 continue
+            if action == "consensus":
+                if not prompt_for_model:
+                    console.print(
+                        "[bold red][ERROR] Please provide a prompt for consensus mode. "
+                        "E.g., /consensus your query here[/bold red]"
+                    )
+                    continue
+                final_output = run_consensus_query(llm.client, prompt_for_model)
+                console.print(f"\nFLAME (Verified):\n{final_output}\n")
+                continue
             if action == "prompt":
                 pass
             elif action in ("invalid", "unrecognized"):
@@ -200,7 +266,7 @@ def main():
 
         # 1. Route Intent & Log Classification Latency (in ms)
         if one_turn_model is not None:
-            chosen_model = one_turn_model
+            chosen_model = resolve_available_model(llm, router, one_turn_model)
             route_ms = 0.0
             route_notice = " (Bypassed via /command)"
         elif current_session_model is not None:
@@ -211,8 +277,8 @@ def main():
             chosen_model, route_ms = run_with_thinking(
                 lambda: router.route_with_timing(prompt_for_model)
             )
+            chosen_model = llm.resolve_model_name(chosen_model)
             route_notice = ""
-            current_session_model = chosen_model
         active_model = chosen_model
         lock_indicator = " [LOCKED]" if current_session_model else " [AUTO]"
         console.print(
@@ -284,7 +350,7 @@ def main():
                     })
 
                 continue
-
+            # Inside your user input loop in main.py:
             if response_message.content:
                 # Stop response timer and convert duration to minutes
                 elapsed_min = (time.perf_counter() - start_response_time) / 60

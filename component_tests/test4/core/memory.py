@@ -72,15 +72,19 @@ class MemoryManager:
 
     def trim_history(self, history: list, max_messages: int = 10) -> list:
         """
-        Trims history while preserving index 0 (system prompt) and 
+        Trims history while preserving index 0 (system prompt) and
         preventing orphaned 'tool' role messages at the trim boundary.
         """
         if max_messages < 0:
             raise ValueError("max_messages must be non-negative")
+
+        system_msg = history[0] if history and self._role(history[0]) == "system" else None
+        if max_messages == 0:
+            return [system_msg] if system_msg else []
+
         if len(history) <= max_messages + 1:
             return history
 
-        system_msg = history[0] if history and self._role(history[0]) == "system" else None
         recent = history[-max_messages:]
 
         # Do not send tool results without the assistant tool-call request.

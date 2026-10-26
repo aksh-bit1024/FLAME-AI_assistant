@@ -21,9 +21,9 @@ class LLMRouter:
             "fast_tool": "gemma4-it-e2b-FLM",
             "general_default": "gemma4-it-e4b-FLM",
             "reasoning": "DeepSeek-R1-Distill-Qwen-1.5B-NPU",
-            "coder": "Qwen2.5-Coder-7B-Instruct-Hybrid",
+            "coder": "Qwen2.5-Coder-7B-Instruct",
             "instruct_npu": "Qwen2.5-7B-Instruct-NPU",
-            "heavy_general": "Qwen2.5-14B-instruct-Hybrid"
+            "heavy_general": "Qwen2.5-14B-Instruct-Hybrid"
         }
 
     @staticmethod
